@@ -1,16 +1,5 @@
 use core::arch::global_asm;
-
-global_asm!(include_str!("trap.S"));
-
-pub fn init() {
-    extern "C" { fn __alltraps(); }
-    unsafe {
-        stvec::write(__alltraps as usize, TrapMode::Direct);
-    }
-}
-
-mod context;
-
+use core::arch::asm;
 use riscv::register::{
     mtvec::TrapMode,
     stvec,
@@ -23,21 +12,38 @@ use riscv::register::{
     stval,
     sie,
 };
-
-use crate::syscall::syscall;
 use crate::task::{
     exit_current_and_run_next,
     suspend_current_and_run_next,
+    current_user_token,
+    current_trap_cx,
 };
 use crate::timer::set_next_trigger;
+use crate::syscall::syscall;
+use crate::config::{TRAP_CONTEXT, TRAMPOLINE};
 
-/// 启用时钟中断
-pub fn enable_timer_interrupt() {
-    unsafe { sie::set_stimer(); }
+global_asm!(include_str!("trap.S"));
+
+pub fn init() {
+    set_kernel_trap_entry();
+}
+
+fn set_kernel_trap_entry() {
+    unsafe {
+        stvec::write(trap_from_kernel as usize, TrapMode::Direct);
+    }
+}
+
+fn set_user_trap_entry() {
+    unsafe {
+        stvec::write(TRAMPOLINE as usize, TrapMode::Direct);
+    }
 }
 
 #[no_mangle]
-pub fn trap_handler(cx: &mut TrapContext) -> &mut TrapContext {
+pub fn trap_handler() -> ! {
+    set_kernel_trap_entry();
+    let cx = current_trap_cx();
     let scause = scause::read();
     let stval = stval::read();
     match scause.cause() {
@@ -47,8 +53,7 @@ pub fn trap_handler(cx: &mut TrapContext) -> &mut TrapContext {
         }
         Trap::Exception(Exception::StoreFault) |
         Trap::Exception(Exception::StorePageFault) => {
-            println!("[kernel] PageFault in application, bad addr = {:#x}, bad instruction = {:#x}, core dumped.", 
-                    stval, cx.sepc);
+            println!("[kernel] PageFault in application, bad addr = {:#x}, bad instruction = {:#x}, core dumped.", stval, cx.sepc);
             exit_current_and_run_next();
         }
         Trap::Exception(Exception::IllegalInstruction) => {
@@ -56,14 +61,46 @@ pub fn trap_handler(cx: &mut TrapContext) -> &mut TrapContext {
             exit_current_and_run_next();
         }
         Trap::Interrupt(Interrupt::SupervisorTimer) => {
-            set_next_trigger();       // 设置下一次时钟中断
-            suspend_current_and_run_next();  // 暂停当前应用并切换到下一个
+            set_next_trigger();
+            suspend_current_and_run_next();
         }
         _ => {
             panic!("Unsupported trap {:?}, stval = {:#x}!", scause.cause(), stval);
         }
     }
-    cx
+    trap_return();
 }
 
+#[no_mangle]
+pub fn trap_return() -> ! {
+    set_user_trap_entry();
+    let trap_cx_ptr = TRAP_CONTEXT;
+    let user_satp = current_user_token();
+    extern "C" {
+        fn __alltraps();
+        fn __restore();
+    }
+    let restore_va = __restore as usize - __alltraps as usize + TRAMPOLINE;
+    unsafe {
+        asm!(
+            "fence.i",
+            "jr {restore_va}",
+            restore_va = in(reg) restore_va,
+            in("a0") trap_cx_ptr,
+            in("a1") user_satp,
+            options(noreturn)
+        );
+    }
+}
+
+#[no_mangle]
+pub fn trap_from_kernel() -> ! {
+    panic!("a trap from kernel!");
+}
+
+pub fn enable_timer_interrupt() {
+    unsafe { sie::set_stimer(); }
+}
+
+mod context;
 pub use context::TrapContext;
