@@ -4,3 +4,7 @@ app_0: 00power_3
 app_1: 01power_5
 app_2: 02power_7
 app_3: 03sleep
+app_4: getpid
+app_5: hello
+app_6: initproc
+app_7: user_shell
